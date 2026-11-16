@@ -14,8 +14,8 @@ from .textutil import answer_line, contains, extract_json, matches, numbers
 from .util import fold, nfc
 
 
-ASK_RE = {"pl": r"(\?|\b(podaj|proszę o (podanie|potwierdzenie|informację)|potwierdź|wskaż|daj znać)\b)",
-          "en": r"(\?|\b(please (provide|confirm|tell|share|specify|let me know)|let me know|confirm which)\b)"}
+ASK_RE = {"pl": r"(\?|\b(podaj|podać|proszę o|potwierdź|potwierdzić|wskaż|wskazać|daj znać|napisz,? (któr|jak|gdzie|czy))\b)",
+          "en": r"(\?|\b(please (provide|confirm|tell|share|specify|send|let me know)|let me know|could you (provide|tell|share|confirm)|i('ll| will)? need (the|your|to know))\b)"}
 
 
 def asks_user(text, lang):
@@ -102,9 +102,10 @@ def score_match(check, rec, case, lang):
 
 def score_answer(check, rec, case, lang):
     """Final choice of an agent task: which item it picked (by id/url) and at what number.
-    Reads the CHOICE:/WYBÓR: line when present so listing every candidate earns nothing."""
+    The CHOICE:/WYBÓR: line is REQUIRED (unless the check sets require_answer_line: false),
+    so a reply that lists every candidate cannot earn credit for the one it never chose."""
     spec = resolve(check["expected"], lang)
-    text, where = _answer_text(rec, check)
+    text, where = _answer_text(rec, {"require_answer_line": True, **check})
     if text is None:
         return _res(0, False, where)
     parts = _match_parts(spec, text, lang)
@@ -112,11 +113,21 @@ def score_answer(check, rec, case, lang):
         tol = float(spec.get("tol", 0.01))
         nums = numbers(text)
         parts.append((any(abs(n - float(spec["number"])) <= tol for n in nums), f"number {spec['number']} ± {tol}"))
+    if "set" in spec:
+        # the answer must list EXACTLY these items (no more, no fewer); items matched by token_regex
+        pat = spec.get("token_regex", r"[A-Za-z]{1,4}-\d{1,4}")
+        got = {fold(t) for t in re.findall(pat, nfc(text))}
+        want = {fold(str(t)) for t in resolve(spec["set"], lang)}
+        missing, extra = sorted(want - got), sorted(got - want)
+        # partial credit = Jaccard overlap (each wrong inclusion costs as much as each omission); passed = exact set
+        jac = len(want & got) / len(want | got) if (want | got) else 1.0
+        parts.append((jac if spec.get("partial", True) else float(jac == 1.0),
+                      f"set: missing {missing}, extra {extra} (overlap {jac:.2f})" if (missing or extra) else "set exact"))
     if not parts:
         return _res(0, False, "empty answer spec")
-    n = sum(ok for ok, _ in parts)
-    return _res(n / len(parts), n == len(parts),
-                f"{where}: " + "; ".join(("ok " if ok else "FAIL ") + d for ok, d in parts))
+    n = sum(float(ok) for ok, _ in parts)
+    return _res(n / len(parts), all(float(ok) == 1.0 for ok, _ in parts),
+                f"{where}: " + "; ".join(("ok " if float(ok) == 1.0 else "FAIL ") + d for ok, d in parts))
 
 
 # --- structured output --------------------------------------------------------
@@ -229,10 +240,8 @@ def _arg_ok(rule, value, lang):
             return isinstance(value, str) and all(contains(c, value) for c in
                                                   (rule["contains"] if isinstance(rule["contains"], list) else [rule["contains"]]))
         if "numeric" in rule:
-            try:
-                return abs(float(value) - float(rule["numeric"])) <= float(rule.get("tol", 1e-6))
-            except (TypeError, ValueError):
-                return False
+            return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and abs(float(value) - float(rule["numeric"])) <= float(rule.get("tol", 1e-6)))
         if "list_of" in rule:
             # every expected element (a dict of per-field rules) must match a distinct element of the list
             if not isinstance(value, list):
@@ -255,12 +264,10 @@ def _arg_ok(rule, value, lang):
     if isinstance(rule, str):
         return isinstance(value, str) and fold(value) == fold(rule)
     if isinstance(rule, bool) or rule is None:
-        return value is rule or value == rule
+        return value is rule
     if isinstance(rule, (int, float)):
-        try:
-            return abs(float(value) - float(rule)) < 1e-6
-        except (TypeError, ValueError):
-            return False
+        # the schema says number: a string "21.5" or a boolean is a type error (BFCL-style)
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and abs(float(value) - float(rule)) < 1e-6
     return value == rule
 
 
@@ -292,6 +299,8 @@ def score_tool_call(check, rec, case, lang):
     if exp.get("none") or exp.get("ask"):
         if calls:
             return _res(0, False, f"called {[c.get('name') for c in calls]} but should not call any tool{note}")
+        if not final_text(rec).strip():
+            return _res(0, False, f"no tool call, but also no reply at all (finish_reason={(rec.get('final') or {}).get('finish_reason')})")
         if exp.get("ask"):
             text = final_text(rec)
             asked = asks_user(text, lang) and (not exp.get("ask_regex") or matches(resolve(exp["ask_regex"], lang), text))
@@ -376,7 +385,7 @@ def _rule(rule, state, lang):
         for v in vals:
             merged += v if isinstance(v, list) else [v]
         vals = [merged]
-    checks = {k: resolve(rule[k], lang) for k in ("eq", "contains_all", "contains_any", "regex", "set", "subset") if k in rule}
+    checks = {k: resolve(rule[k], lang) for k in ("eq", "contains_all", "contains_any", "regex", "set", "subset", "approx") if k in rule}
     def ok_one(v):
         txt = " ".join(map(str, v)) if isinstance(v, list) else str(v or "")
         if "eq" in checks and not ((fold(str(v)) == fold(checks["eq"])) if isinstance(checks["eq"], str) else v == checks["eq"]):
@@ -391,6 +400,12 @@ def _rule(rule, state, lang):
             return False
         if "subset" in checks and not (isinstance(v, list) and {fold(str(x)) for x in checks["subset"]} <= {fold(str(x)) for x in v}):
             return False
+        if "approx" in checks:
+            try:
+                if abs(float(v) - float(checks["approx"])) > float(rule.get("tol", 0.01)):
+                    return False
+            except (TypeError, ValueError):
+                return False
         return True
     ok = all(ok_one(v) for v in vals) if rule.get("all") else any(ok_one(v) for v in vals)
     return ok, f"{label}.{field}: {str(vals)[:120]} vs {checks}"
@@ -409,7 +424,7 @@ def score_env_state(check, rec, case, lang):
 # --- code -------------------------------------------------------------------
 
 def score_code_tests(check, rec, case, lang):
-    code = extract_code(final_text(rec))
+    code = extract_code(final_text(rec), check["entry"])
     if check["entry"] not in code:
         return _res(0, False, f"function {check['entry']!r} not found in the reply")
     out = run_python(code, check["tests"], timeout=int(check.get("timeout", 15)))
@@ -433,7 +448,17 @@ SCORERS = {
 }
 
 
-def score_check(check, rec, case, lang):
+# Scorers that grade what the model SAID. On an empty reply they must score 0: otherwise vacuous
+# rules ("no commas", "at most 40 words", not_regex) hand out credit for saying nothing.
+CONTENT_SCORERS = {"exact", "numeric", "match", "answer", "json_schema", "ifeval", "code_tests", "rubric"}
+
+
+def score_check(check, rec, case, lang, run_code=True):
     if rec.get("error") and not rec.get("final"):
-        return _res(0, False, f"generation failed: {rec['error'][:200]}")
+        return _res(0, False, f"no usable answer: {rec['error'][:200]}")
+    if check["scorer"] in CONTENT_SCORERS and not final_text(rec).strip():
+        fr = (rec.get("final") or {}).get("finish_reason")
+        return _res(0, False, "empty reply" + (" (ran out of max_tokens while reasoning)" if fr == "length" else f" (finish_reason={fr})"))
+    if check["scorer"] == "code_tests" and not run_code:
+        return {"score": None, "passed": None, "detail": "not executed: run was generated on another host (grade with --trust-code)"}
     return SCORERS[check["scorer"]](check, rec, case, lang)

@@ -65,11 +65,12 @@ def host_info():
     return info
 
 
-def suite_info(cases):
-    items = [{"id": c.id, "version": c.get("version"), "sha256": c.sha256, "family": c.get("family"),
+def suite_info(cases, name="core"):
+    items = [{"id": c.id, "version": c.get("version"), "sha256": c.sha256,
+              "prompt_sha256": getattr(c, "prompt_sha256", None), "family": c.get("family"),
               "review": c.get("review"), "path": os.path.relpath(c.path, REPO) if c.path.startswith(REPO) else None}
              for c in cases]
-    return {"n_cases": len(items), "suite_sha256": sha256_json(sorted((i["id"], i["sha256"]) for i in items)),
+    return {"name": name, "n_cases": len(items), "suite_sha256": sha256_json(sorted((i["id"], i["sha256"]) for i in items)),
             "cases": items}
 
 
@@ -146,7 +147,7 @@ def compare_sampling(requested, effective):
     return diffs
 
 
-def build_manifest(run_id, prof, preset, cases, k, langs, argv):
+def build_manifest(run_id, prof, preset, cases, k, langs, argv, suite="core"):
     return {
         "qbench_version": __version__,
         "run_id": run_id,
@@ -155,16 +156,17 @@ def build_manifest(run_id, prof, preset, cases, k, langs, argv):
         "command": scrub_home(" ".join(argv)),
         "bench": bench_commit(),
         "host": host_info(),
-        "suite": suite_info(cases),
+        "suite": suite_info(cases, suite),
         "model": profile_info(prof),
         "preset": preset,
         "k": k,
         "langs": langs,
         "request_policy": {
             "sequential": True,
-            "cache_prompt": False,
+            "cache_prompt": False if not prof["endpoint"].get("strict_openai") else "not sent (strict_openai)",
             "seed": "crc32(run_id|case|lang|sample) + turn",
-            "all_samplers_explicit": True,
+            "all_samplers_explicit": not prof["endpoint"].get("strict_openai"),
+            "strict_openai": bool(prof["endpoint"].get("strict_openai")),
         },
         "server": None,
         "effective_sampling": None,

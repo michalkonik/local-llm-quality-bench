@@ -6,21 +6,22 @@ import json
 import os
 import sys
 
-from .cases import LANGS, load_cases, validate_all
-from .util import REPO
+from .cases import LANGS, SUITES, load_cases, validate_all
+from .util import REPO, RESULTS_DIR, RUNS_DIR
 
 
 def _run_dir(arg):
-    for base in ("", os.path.join(REPO, "runs"), os.path.join(REPO, "results")):
+    for base in ("", RUNS_DIR, RESULTS_DIR):
         p = os.path.join(base, arg) if base else arg
         if os.path.isfile(os.path.join(p, "manifest.json")):
             return p
-    raise SystemExit(f"no run directory {arg!r} (looked in ., runs/, results/)")
+    raise SystemExit(f"no run directory {arg!r} (looked in ., {RUNS_DIR}, {RESULTS_DIR})")
 
 
 def cmd_validate(a):
     from .profiles import list_profiles, load_profile
-    cases = load_cases(a.paths or None)
+    cases = [c for s in ([a.suite] if a.suite else SUITES) for c in load_cases(a.paths or None, suite=s)] \
+        if not a.paths else load_cases(a.paths)
     errs = validate_all(cases)
     for name in list_profiles():
         try:
@@ -48,8 +49,7 @@ def cmd_list(a):
         p = load_profile(name)
         print(f"  {name:28s} family={p['family']:10s} presets: {', '.join(p['presets'])}")
     print("\nRuns:")
-    for base in ("runs", "results"):
-        d = os.path.join(REPO, base)
+    for base, d in (("runs", RUNS_DIR), ("results", RESULTS_DIR)):
         for r in sorted(os.listdir(d)) if os.path.isdir(d) else []:
             if os.path.exists(os.path.join(d, r, "manifest.json")):
                 graded = os.path.exists(os.path.join(d, r, "grades.jsonl"))
@@ -61,7 +61,7 @@ def cmd_run(a):
     from .profiles import load_profile
     from .runner import run_suite
     prof = load_profile(a.model)
-    cases = load_cases(a.cases or None, families=a.family, ids=a.case)
+    cases = load_cases(a.cases or None, families=a.family, ids=a.case, suite=a.suite)
     errs = validate_all(cases)
     if errs:
         print("\n".join(errs))
@@ -69,9 +69,11 @@ def cmd_run(a):
     if not cases:
         raise SystemExit("no cases selected")
     preset_name = a.preset or prof.get("default_preset") or next(iter(prof["presets"]))
-    run_id = a.run_id or f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{prof['name']}-{preset_name}"
-    run_dir = a.out or os.path.join(REPO, "runs", run_id)
-    run_suite(prof, preset_name, cases, a.k, run_dir, langs=a.lang or LANGS, argv=sys.argv)
+    tag = "" if a.suite == "core" else f"-{a.suite}"
+    run_id = a.run_id or f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{prof['name']}-{preset_name}{tag}"
+    run_dir = a.out or os.path.join(RUNS_DIR, run_id)
+    run_suite(prof, preset_name, cases, a.k, run_dir, langs=a.lang or LANGS, argv=sys.argv,
+              suite=a.suite if not a.cases else "custom")
     print(run_dir)
     return 0
 
@@ -89,7 +91,7 @@ def cmd_grade(a):
     from .grade import grade_run
     judges = _judges(a)
     for r in a.runs:
-        grade_run(_run_dir(r), judges=judges, allow_changed=a.allow_changed)
+        grade_run(_run_dir(r), judges=judges, allow_changed=a.allow_changed, trust_code=a.trust_code)
     return 0
 
 
@@ -99,13 +101,13 @@ def cmd_report(a):
         rd = _run_dir(r)
         if a.publish:
             dest = publish(rd)
-            print(f"published -> {os.path.relpath(dest, REPO)}/report.md")
+            print(f"published -> {dest}/report.md")
         else:
             write_report(rd)
             print(f"{os.path.join(rd, 'report.md')}")
     if a.publish or not a.runs:
         update_leaderboard()
-        print("results/leaderboard.md updated")
+        print(f"{os.path.join(RESULTS_DIR, 'leaderboard.md')} updated")
     return 0
 
 
@@ -124,7 +126,7 @@ def cmd_compare(a):
         sa = {k: v for k, v in ia.items() if pred(k, v)}
         sb = {k: v for k, v in ib.items() if pred(k, v)}
         d = paired_diff(sa, sb)
-        print(f"{name:24s} {pct_ci({'mean': d['diff'], 'ci': d['ci']}):>28s}  {d['n_items']}")
+        print(f"{name:24s} {pct_ci({'mean': d['diff'], 'ci': d['ci']}, signed=True):>28s}  {d['n_items']}")
     print("\nA difference is credible only when its CI excludes 0.")
     return 0
 
@@ -162,12 +164,11 @@ def cmd_calibrate(a):
     from .calibrate import export, import_labels
     if a.action == "export":
         path, n = export([_run_dir(r) for r in a.items], n=a.n)
-        print(f"wrote {n} items to {os.path.relpath(path, REPO)}; fill in `human:` then run "
-              f"`qbench calibrate import {os.path.relpath(path, REPO)}`")
+        print(f"wrote {n} items to {path}; fill in `human:` then run `qbench calibrate import {path}`")
     else:
         res, outs = import_labels(a.items[0])
         print(json.dumps(res, indent=2))
-        print("saved:", ", ".join(os.path.relpath(o, REPO) for o in outs))
+        print("saved:", ", ".join(outs))
     return 0
 
 
@@ -197,6 +198,7 @@ def main(argv=None):
 
     s = sub.add_parser("validate", help="validate case files and model profiles")
     s.add_argument("paths", nargs="*")
+    s.add_argument("--suite", choices=list(SUITES), help="validate one suite only (default: all)")
     s.set_defaults(fn=cmd_validate)
 
     s = sub.add_parser("list", help="list model profiles and runs")
@@ -206,6 +208,8 @@ def main(argv=None):
     s.add_argument("--model", required=True, help="model profile name (models/<name>.yaml) or path")
     s.add_argument("--preset", help="preset name (default: the profile's default_preset)")
     s.add_argument("--k", type=int, default=5, help="samples per item (default 5; use 3 for screening)")
+    s.add_argument("--suite", choices=list(SUITES), default="core",
+                   help="core (60 tasks) or hard (long agentic workflows, multi-hop web research, long documents)")
     s.add_argument("--lang", action="append", choices=LANGS, help="restrict to a language (repeatable)")
     s.add_argument("--family", action="append", help="restrict to a case family (repeatable)")
     s.add_argument("--case", action="append", help="restrict to a case id (repeatable)")
@@ -219,10 +223,13 @@ def main(argv=None):
     s.add_argument("--judge", action="append", help="judge model profile(s), in preference order")
     s.add_argument("--judge-config", help="judge config (default judges/default.yaml)")
     s.add_argument("--no-judge", action="store_true", help="skip rubric checks (they stay pending)")
-    s.add_argument("--allow-changed", action="store_true", help="grade even if case files changed since the run")
+    s.add_argument("--allow-changed", action="store_true",
+                   help="grade even if a case's PROMPT changed since the run (changed checks alone are always fine)")
+    s.add_argument("--trust-code", action="store_true",
+                   help="execute code_tests for a run generated on another host (runs that run's model output)")
     s.set_defaults(fn=cmd_grade)
 
-    s = sub.add_parser("report", help="write report.md/summary.json; --publish copies into results/ + leaderboard")
+    s = sub.add_parser("report", help="write report.md/summary.json; --publish copies into $QBENCH_RESULTS + leaderboard")
     s.add_argument("runs", nargs="*")
     s.add_argument("--publish", action="store_true")
     s.set_defaults(fn=cmd_report)

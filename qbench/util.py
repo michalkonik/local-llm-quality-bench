@@ -7,6 +7,11 @@ import unicodedata
 import zlib
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Published results (graded runs, leaderboard, judge calibrations). Keep them OUT of the tool repo by pointing
+# this at a results repo, e.g. QBENCH_RESULTS=~/local-llm-bench-results/quality. Scratch runs stay in ./runs.
+RESULTS_DIR = os.path.abspath(os.path.expanduser(os.environ.get("QBENCH_RESULTS") or os.path.join(REPO, "results")))
+RUNS_DIR = os.path.abspath(os.path.expanduser(os.environ.get("QBENCH_RUNS") or os.path.join(REPO, "runs")))
+METHODOLOGY_URL = "https://github.com/michal-koniu/local-llm-quality-bench/blob/main/docs/METHODOLOGY.md"
 
 
 def sha256_bytes(data):
@@ -57,6 +62,25 @@ def scrub_home(obj):
     if isinstance(obj, dict):
         return {k: scrub_home(v) for k, v in obj.items()}
     return obj
+
+
+UNPARSEABLE_MARKERS = ("does not match the expected", "produced output that", "failed to parse tool call",
+                       "could not parse", "couldn't be parsed")
+
+
+def error_class(rec):
+    """None (clean answer) | 'max_turns' | 'unparseable' | 'transport'.
+    'max_turns' and 'unparseable' are the MODEL's behaviour (it kept calling tools, or emitted output the
+    server's tool-call/format parser rejected) and are scored as failures; 'transport' (connection errors,
+    timeouts, other server errors) says nothing about the model, so it is retried and never scored."""
+    err = rec.get("error")
+    if not err:
+        return None
+    if err.startswith("max_turns"):
+        return "max_turns"
+    if any(m in err.lower() for m in UNPARSEABLE_MARKERS):
+        return "unparseable"
+    return "transport"
 
 
 def read_jsonl(path):

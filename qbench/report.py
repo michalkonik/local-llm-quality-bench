@@ -10,22 +10,34 @@ from .cases import FAMILIES
 from .grade import load_grades
 from .manifest import load_manifest, now
 from .stats import bootstrap_ci, items as group_items, lang_gap, summarize
-from .util import REPO, write_json
+from .util import METHODOLOGY_URL, RESULTS_DIR, write_json
 
 FAMILY_LABEL = {"tool_calling": "Tools", "agentic": "Agent", "web_shopping": "Shop",
-                "instruction_following": "Instr.", "writing": "Writing", "reasoning": "Reason.", "coding": "Code"}
-RELIABILITY_FAMILIES = ("tool_calling", "agentic", "web_shopping")
-CALIB_DIR = os.path.join(REPO, "judges", "calibration")
+                "instruction_following": "Instr.", "writing": "Writing", "reasoning": "Reason.", "coding": "Code",
+                "web_research": "Research", "long_context": "Long docs"}
+RELIABILITY_FAMILIES = ("tool_calling", "agentic", "web_shopping", "web_research")
+SUITE_TITLE = {"core": "Core suite", "hard": "Hard suite", "custom": "Custom case selection"}
+CALIB_DIR = os.path.join(RESULTS_DIR, "calibration")
 
 
 def pct(x):
     return "–" if x is None else f"{100 * x:.0f}"
 
 
-def pct_ci(s):
+def spct(x):
+    """Signed points for differences: +3, −2 (true minus sign), 0."""
+    if x is None:
+        return "–"
+    v = round(100 * x)
+    return f"+{v}" if v > 0 else (f"\u2212{-v}" if v < 0 else "0")
+
+
+def pct_ci(s, signed=False):
     if not s or s.get("mean") is None:
         return "–"
-    lo, hi = s["ci"]
+    lo, hi = (s.get("ci") or [None, None])
+    if signed:
+        return spct(s["mean"]) + (f" ({spct(lo)} to {spct(hi)})" if lo is not None else "")
     return f"{pct(s['mean'])}" + (f" ({pct(lo)}–{pct(hi)})" if lo is not None else "")
 
 
@@ -63,6 +75,7 @@ def summarize_run(run_dir):
     imap = group_items(grades)
     prof = manifest["model"]["profile"]
     out = {"run_id": manifest["run_id"], "generated_at": now(), "k": manifest["k"],
+           "suite": (manifest.get("suite") or {}).get("name", "core"),
            "model": {"name": prof["name"], "display": prof.get("display", prof["name"]), "family": prof["family"],
                      "quant": (prof.get("weights") or {}).get("quant"), "params": prof.get("params"),
                      "license": prof.get("license"), "repo": (prof.get("weights") or {}).get("repo"),
@@ -94,7 +107,13 @@ def summarize_run(run_dir):
     out["cost"] = {"median_completion_tokens": statistics.median(toks) if toks else None,
                    "median_decode_tps": round(statistics.median(tps), 1) if tps else None,
                    "median_latency_s": round(statistics.median(lat), 2) if lat else None}
+    out["checks_revised"] = gmeta.get("checks_revised") or []
+    out["grader"] = gmeta.get("grader")
     out["health"] = {"samples": len(grades), "errors": sum(1 for g in grades if g.get("error")),
+                     "excluded": sum(1 for g in grades if g.get("excluded")),
+                     "max_turns": sum(1 for g in grades if g.get("error_class") == "max_turns"),
+                     "unparseable": sum(1 for g in grades if g.get("error_class") == "unparseable"),
+                     "truncated": sum(1 for g in grades if g.get("finish_reason") == "length"),
                      "pending": sum(1 for g in grades if g.get("pending")),
                      "tool_parse_fallback": sum(1 for g in grades if g.get("tool_parse") == "fallback"),
                      "cases_pending_review": len({g["case"] for g in grades if g.get("review") != "frozen"}),
@@ -119,7 +138,8 @@ def _failures(grades, per_family=2):
 
 def render_report(summary, manifest, grades):
     m, p = summary["model"], summary["preset"]
-    L = [f"# Quality run `{summary['run_id']}`: {m['display']} / preset `{p['name']}`", ""]
+    L = [f"# Quality run `{summary['run_id']}`: {m['display']} / preset `{p['name']}`", "",
+         f"**{SUITE_TITLE.get(summary.get('suite', 'core'), summary.get('suite'))}**", ""]
     h = summary["health"]
     cal = summary["judge_calibration"]
     L += ["| | |", "|---|---|",
@@ -129,10 +149,16 @@ def render_report(summary, manifest, grades):
           f"| Samplers sent | `{json.dumps(p['sampling'])}`, max_tokens {p['max_tokens']}"
           + (f", extra `{json.dumps(p['extra_body'], ensure_ascii=False)}`" if p.get("extra_body") else "") + " |",
           f"| Preset source | {p.get('source') or '–'} |",
-          f"| Samples | k = {summary['k']} per item, {h['samples']} total, {h['errors']} errors, {h['pending']} pending grades |",
+          f"| Samples | k = {summary['k']} per item, {h['samples']} total; {h['excluded']} excluded (server/transport errors), "
+          f"{h['max_turns']} ran out of turns, {h['unparseable']} unparseable output (rejected by the server's parser, scored 0), "
+          f"{h['truncated']} hit max_tokens, {h['pending']} pending grades |",
           f"| Judge | {summary.get('judge') or 'none'}" + (f", calibrated κ = {cal['kappa']:.2f} on {cal['n']} labels" if cal and cal.get('kappa') is not None else ", **not yet calibrated against human labels**" if summary.get('judge') else "") + " |",
           f"| Suite | {manifest['suite']['n_cases']} cases, sha256 `{manifest['suite']['suite_sha256'][:16]}…`, bench commit `{(manifest['bench'].get('commit') or '?')[:10]}`{' (dirty)' if manifest['bench'].get('dirty') else ''} |",
           ""]
+    if summary.get("checks_revised"):
+        L += [f"> ✏️ Checks revised after generation (prompts unchanged, so the samples stay valid): "
+              f"{', '.join('`' + c + '`' for c in summary['checks_revised'])}. Graded with bench commit "
+              f"`{((summary.get('grader') or {}).get('commit') or '?')[:10]}`.", ""]
     if h["cases_pending_review"]:
         L += [f"> {h['cases_pending_review']} of {h['cases']} cases are still `review: pending-owner` "
               "(written by the bench author, not yet frozen by a native-speaker review).", ""]
@@ -142,17 +168,21 @@ def render_report(summary, manifest, grades):
         L += [f"> ℹ️ {h['tool_parse_fallback']} samples had tool calls returned as text and parsed by qbench "
               "(the server's template parser did not recognise them). Scored normally, flagged here.", ""]
     L += ["## Scores (0–100, mean with 95% cluster-bootstrap CI)", "",
-          "| Family | 🇵🇱 PL | 🇬🇧 EN | PL pass^1 | EN pass^1 | PL pass^k | EN pass^k |", "|---|---|---|---|---|---|---|"]
+          "| Family | 🇵🇱 PL | 🇬🇧 EN | PL pass^1 | EN pass^1 | PL pass^k | EN pass^k | PL worst@k | EN worst@k |",
+          "|---|---|---|---|---|---|---|---|---|"]
     pl, en = summary["langs"].get("pl", {}), summary["langs"].get("en", {})
     for fam in FAMILIES:
         a, b = (pl.get("families") or {}).get(fam), (en.get("families") or {}).get(fam)
         if not a and not b:
             continue
         L.append(f"| {FAMILY_LABEL[fam]} | {pct_ci(a)} | {pct_ci(b)} | {pct((a or {}).get('pass1'))} | "
-                 f"{pct((b or {}).get('pass1'))} | {pct((a or {}).get('pass_k'))} | {pct((b or {}).get('pass_k'))} |")
-    L.append(f"| **Overall** (mean of families) | **{pct_ci(pl.get('overall'))}** | **{pct_ci(en.get('overall'))}** | | | | |")
+                 f"{pct((b or {}).get('pass1'))} | {pct((a or {}).get('pass_k'))} | {pct((b or {}).get('pass_k'))} | "
+                 f"{pct((a or {}).get('worst_k'))} | {pct((b or {}).get('worst_k'))} |")
+    L.append(f"| **Overall** (mean of families) | **{pct_ci(pl.get('overall'))}** | **{pct_ci(en.get('overall'))}** | | | | | | |")
+    L += ["", "_pass^1: share of samples that pass every check. pass^k: chance that all k samples of a task pass. "
+          "worst@k: expected score of the worst of k samples._"]
     gap = summary["lang_gap"]
-    L += ["", f"**PL − EN gap** on parallel tasks: {pct_ci({'mean': gap['gap'], 'ci': gap['ci']})} points "
+    L += ["", f"**PL − EN gap** on parallel tasks: {pct_ci({'mean': gap['gap'], 'ci': gap['ci']}, signed=True)} points "
           f"({gap['n_cases']} paired tasks; negative = worse in Polish).", ""]
     c = summary["cost"]
     L += [f"**Cost:** median {c['median_completion_tokens']} completion tokens per sample, "
@@ -181,9 +211,9 @@ def write_report(run_dir):
 
 
 def publish(run_dir):
-    """Copy a graded run into results/<run_id>/ (tracked in git) and refresh the leaderboard."""
+    """Copy a graded run into <results>/<run_id>/ ($QBENCH_RESULTS, default ./results) and refresh the leaderboard."""
     summary = write_report(run_dir)
-    dest = os.path.join(REPO, "results", summary["run_id"])
+    dest = os.path.join(RESULTS_DIR, summary["run_id"])
     if os.path.abspath(dest) != os.path.abspath(run_dir):
         os.makedirs(dest, exist_ok=True)
         for name in ("manifest.json", "samples.jsonl", "grades.jsonl", "grades-meta.json", "judgments.jsonl",
@@ -195,23 +225,14 @@ def publish(run_dir):
     return dest
 
 
-def update_leaderboard():
-    rows = []
-    for path in sorted(glob.glob(os.path.join(REPO, "results", "*", "summary.json"))):
-        with open(path, encoding="utf-8") as f:
-            rows.append(json.load(f))
+def _suite_section(suite, rows):
+    """Leaderboard section for one suite: a table per language, then the paired PL-EN gap."""
     fams = [f for f in FAMILIES if any(f in (r["langs"].get(l) or {}).get("families", {}) for r in rows for l in ("pl", "en"))]
-    L = ["# Leaderboard", "",
-         "Scores 0–100 with 95% CI (cluster bootstrap over tasks). **Overall** is the mean of family scores, "
-         "so every family weighs the same. **Reliability** is pass^k on tool, agent and shopping tasks: the chance "
-         "that *all k* attempts succeed, which is what an assistant you rely on needs. Configs whose CIs overlap are "
-         "not distinguishable at this sample size.", "",
-         f"_Generated {now()} from `results/*/summary.json` by `qbench report --publish`._", ""]
+    L = [f"# {SUITE_TITLE.get(suite, suite)}", ""]
     for lang, flag in (("pl", "🇵🇱 Polish"), ("en", "🇬🇧 English")):
-        lr = [r for r in rows if lang in r["langs"]]
+        lr = sorted((r for r in rows if lang in r["langs"]), key=lambda r: -(r["langs"][lang]["overall"]["mean"] or 0))
         if not lr:
             continue
-        lr.sort(key=lambda r: -(r["langs"][lang]["overall"]["mean"] or 0))
         L += [f"## {flag}", "",
               "| # | Model | Quant | Preset | **Overall** | " + " | ".join(FAMILY_LABEL[f] for f in fams)
               + " | Reliability pass^k | Tokens/answer | Decode tok/s | Run |",
@@ -225,17 +246,39 @@ def update_leaderboard():
                      f" | {pct(rel.get('pass_k'))} (k={rel.get('k', '–')}) | {r['cost']['median_completion_tokens'] or '–'} | "
                      f"{r['cost']['median_decode_tps'] or '–'} | [{r['run_id']}]({r['run_id']}/report.md) |")
         L.append("")
-    gaps = [r for r in rows if r.get("lang_gap", {}).get("gap") is not None]
+    gaps = [r for r in rows if (r.get("lang_gap") or {}).get("gap") is not None]
     if gaps:
         L += ["## Polish vs English (same tasks, paired)", "", "| Model | Preset | PL − EN (points, 95% CI) | Paired tasks |",
               "|---|---|---|---|"]
         for r in sorted(gaps, key=lambda r: r["lang_gap"]["gap"]):
             g = r["lang_gap"]
-            L.append(f"| {r['model']['display']} | `{r['preset']['name']}` | {pct_ci({'mean': g['gap'], 'ci': g['ci']})} | {g['n_cases']} |")
+            L.append(f"| {r['model']['display']} | `{r['preset']['name']}` | "
+                     f"{pct_ci({'mean': g['gap'], 'ci': g['ci']}, signed=True)} | {g['n_cases']} |")
         L.append("")
+    return L
+
+
+def update_leaderboard():
+    rows = []
+    for path in sorted(glob.glob(os.path.join(RESULTS_DIR, "*", "summary.json"))):
+        with open(path, encoding="utf-8") as f:
+            rows.append(json.load(f))
+    L = ["# Leaderboard", "",
+         "Scores 0–100 with 95% CI (cluster bootstrap over tasks). **Overall** is the mean of family scores, "
+         "so every family weighs the same. **Reliability** is pass^k on tool, agent, shopping and research tasks: the "
+         "chance that *all k* attempts succeed, which is what an assistant you rely on needs. Configs whose CIs overlap "
+         "are not distinguishable at this sample size.", "",
+         "Suites are scored separately and never mixed. The **hard suite** (long agentic workflows, multi-hop web "
+         "research, long documents) is designed so that only frontier models come close to 100.", "",
+         f"_Generated {now()} from `*/summary.json` by `qbench report --publish`._", ""]
+    for suite in ("hard", "core", "custom"):
+        sr = [r for r in rows if r.get("suite", "core") == suite]
+        if sr:
+            L += _suite_section(suite, sr)
     judges = sorted({(r.get("judge") or "none") for r in rows})
     L += [f"Judges used: {', '.join(judges)}. Rubric checks are judged by a model from a *different family* than the "
-          "candidate. See [docs/METHODOLOGY.md](../docs/METHODOLOGY.md).", ""]
-    with open(os.path.join(REPO, "results", "leaderboard.md"), "w", encoding="utf-8") as f:
+          f"candidate. Method: [local-llm-quality-bench METHODOLOGY]({METHODOLOGY_URL}).", ""]
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with open(os.path.join(RESULTS_DIR, "leaderboard.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(L))
     return rows
